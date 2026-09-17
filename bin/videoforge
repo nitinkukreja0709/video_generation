@@ -80,6 +80,18 @@ def queue(base, graph):
     d = api(base, "/prompt", graph)
     return d.get("prompt_id") or d.get("error") or d
 
+def health_check(base, timeout=5):
+    """Return ("ok", "vX.Y.Z") or ("error", reason). Cheap /system_stats probe."""
+    t0 = time.time()
+    d = api(base, "/system_stats", timeout=timeout)
+    if "error" in d:
+        return "error", d["error"]
+    try:
+        ver = d["system"]["comfyui_version"]
+        return "ok", ver
+    except Exception:
+        return "error", "bad payload"
+
 # ---------- graph builders ----------
 def sdxl_storyboard_graph(ckpt, positive, negative, seed, w=1216, h=672, steps=28, cfg=7.0):
     g = {
@@ -152,24 +164,28 @@ def tanpura_drone(seconds, sr=44100, f0=220.0, fout=None):
     return fout
 
 # ---------- stage: voice ----------
-def stage_voice(cfg, wd):
+def stage_voice(cfg, wd, progress=None):
     from edge_tts import Communicate
+    rep = progress or NullReporter()
     outdir = os.path.join(wd, "voice"); os.makedirs(outdir, exist_ok=True)
     results = {}
     for s in cfg["scenes"]:
+        sid = s["id"]
         txt = s.get("narration", "")
         if not txt:
-            continue
-        out = os.path.join(outdir, f"{s['id']}.mp3")
+            rep("voice", sid, "skip", "no narration"); continue
+        out = os.path.join(outdir, f"{sid}.mp3")
         if os.path.exists(out) and os.path.getsize(out) > 0:
-            results[s["id"]] = out; continue
-        comm = Communicate(txt, cfg["meta"].get("voice", "hi-IN-MadhurNeural"))
-        import asyncio
-        async def _w():
-            await comm.save(out)
-        asyncio.run(_w())
-        results[s["id"]] = out
-    print("voice:", json.dumps({k: os.path.basename(v) for k, v in results.items()}))
+            rep("voice", sid, "skip", "exists")
+            results[sid] = out; continue
+        try:
+            comm = Communicate(txt, cfg["meta"].get("voice", "hi-IN-MadhurNeural"))
+            import asyncio
+            asyncio.run(comm.save(out))
+            results[sid] = out
+            rep("voice", sid, "ok", os.path.getsize(out))
+        except Exception as e:
+            rep("voice", sid, "error", str(e))
     return results
 
 # ---------- stage: music ----------
@@ -181,7 +197,8 @@ def stage_music(cfg, wd, total_dur):
     return out
 
 # ---------- stage: render ----------
-def stage_render(cfg, wd, clips, voice_files, music, out_path):
+def stage_render(cfg, wd, clips, voice_files, music, out_path, progress=None):
+    rep = progress or NullReporter()
     clip_len = cfg["meta"]["clip_frames"] / cfg["meta"]["fps"]
     N = len(clips)
     fade = 0.4
@@ -299,47 +316,136 @@ def wd_for(cfg):
     os.makedirs(os.path.join(wd, "storyboard"), exist_ok=True)
     return wd
 
-def stage_storyboard(cfg, boxes, wd):
+def run_pipeline(cfg_path, stages=("storyboard", "animate", "voice", "render"),
+                 progress=None):
+    """Orchestrate the whole pipeline. progress(stage, scene, status, msg).
+    Returns dict {status, final, clips, errors}."""
+    rep = progress or NullReporter()
+    cfg = load_cfg(cfg_path)
+    boxes = [cfg["boxes"][k] for k in sorted(cfg["boxes"])]
+    wd = wd_for(cfg)
+    errors = []
+    if "storyboard" in stages:
+        rep("stage", "storyboard", "start", None)
+        try:
+            stage_storyboard(cfg, boxes, wd, rep)
+            rep("stage", "storyboard", "ok", None)
+        except Exception as e:
+            rep("stage", "storyboard", "error", str(e)); errors.append(("storyboard", str(e)))
+    clips = {}
+    if "animate" in stages:
+        rep("stage", "animate", "start", None)
+        try:
+            clips = stage_animate(cfg, boxes, wd, rep)
+            rep("stage", "animate", "ok", None)
+        except Exception as e:
+            rep("stage", "animate", "error", str(e)); errors.append(("animate", str(e)))
+    if "voice" in stages:
+        rep("stage", "voice", "start", None)
+        try:
+            stage_voice(cfg, wd, rep)
+            rep("stage", "voice", "ok", None)
+        except Exception as e:
+            rep("stage", "voice", "error", str(e)); errors.append(("voice", str(e)))
+    final = None
+    if "render" in stages:
+        rep("stage", "render", "start", None)
+        try:
+            n = len(cfg["scenes"])
+            clip_len = cfg["meta"]["clip_frames"] / cfg["meta"]["fps"]
+            total = n * clip_len + 1.0
+            music = stage_music(cfg, wd, total)
+            missing = [s["id"] for s in cfg["scenes"]
+                       if not os.path.exists(os.path.join(wd, "clips", s["id"] + ".mp4"))]
+            if missing:
+                rep("stage", "render", "warn", f"missing clips: {missing}")
+            voice_files = {s["id"]: os.path.join(wd, "voice", s["id"] + ".mp3")
+                           for s in cfg["scenes"] if s.get("narration")}
+            final = os.path.join(wd, "final.mp4")
+            ok = stage_render(cfg, wd, [s["id"] for s in cfg["scenes"]],
+                              voice_files, music, final, rep)
+            if ok:
+                rep("stage", "render", "ok", None)
+            else:
+                rep("stage", "render", "error", "ffmpeg failed")
+                errors.append(("render", "ffmpeg failed"))
+                final = None
+        except Exception as e:
+            rep("stage", "render", "error", str(e)); errors.append(("render", str(e)))
+    return {"status": "error" if errors else "done", "errors": errors,
+            "final": final, "wd": wd, "clips": clips}
+
+# ---------- progress reporting ----------
+def NullReporter():
+    return lambda *a, **k: None
+
+# ---------- storyboard stage ----------
+def stage_storyboard(cfg, boxes, wd, progress=None):
     ckpt = "sd_xl_base_1.0.safetensors"
     style = cfg["style"]
     char = cfg.get("character", {}).get("physical", "")
+    rep = progress or NullReporter()
     base = boxes[0]
     fixed = random.Random(42)
     for s in cfg["scenes"]:
-        out = os.path.join(wd, "storyboard", s["id"] + ".png")
+        sid = s["id"]
+        out = os.path.join(wd, "storyboard", sid + ".png")
         if os.path.exists(out) and os.path.getsize(out) > 0:
+            rep("storyboard", sid, "skip", "exists")
             continue
         # identity block repeated verbatim for character/place consistency
         pos = (f"{char}. {cfg['character'].get('identity','')}. {s['visual']}. {s['cam']}. {style['global_prompt']}")
         g = sdxl_storyboard_graph(ckpt, pos, style["negative_prompt"], fixed.randrange(0, 2 ** 31))
-        pid = queue(base["base"], g)
+        reps = 0
+        while reps < 3:
+            pid = queue(base["base"], g)
+            if isinstance(pid, str):
+                break
+            reps += 1
+            rep("storyboard", sid, "retry", f"queue fail: {pid} (attempt {reps})")
+            time.sleep(5)
         if not isinstance(pid, str):
-            print("storyboard queue fail", s["id"], pid); continue
+            rep("storyboard", sid, "error", str(pid)); continue
         st, outs = wait_prompt(base["base"], pid)
         fname = next((o[2]["filename"] for o in outs if o[1] == "images"), None)
         if fname:
             api(base["base"], f"/view?filename={fname}&subfolder=&type=output", stream_out=out)
-        print("storyboard", s["id"], st, os.path.basename(out))
+        rep("storyboard", sid, "ok" if fname else "error", f"st={st}, {os.path.getsize(out) if os.path.exists(out) else 0}B")
     return os.path.join(wd, "storyboard")
 
-def stage_animate(cfg, boxes, wd):
+def stage_animate(cfg, boxes, wd, progress=None):
     model = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
     lora = "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
     clip_m = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
     vae_m = "wan_2.1_vae.safetensors"
     neg = cfg["style"]["negative_prompt"]
     scenes = cfg["scenes"]
+    rep = progress or NullReporter()
 
-    # Phase 1: submit all clips, round-robin across boxes, upload storyboards to target box
-    pending = []  # (scene_id, boxbase, prompt_id, outmp4)
+    # Liveness: only schedule on boxes that respond; retry submittable boxes.
+    def alive_box(b):
+        st, v = health_check(b["base"], timeout=6)
+        if st != "ok":
+            rep("animate", "*", "warn", f"box {b.get('name','?')} DOWN: {v}")
+            return False
+        return True
+
+    # Phase 1: submit all clips, round-robin across healthy boxes
+    pending = []  # (scene_id, boxbase, prompt_id, outmp4, attempts)
     results = {}
+    healthy = [b for b in boxes if alive_box(b)]
+    if not healthy:
+        raise RuntimeError("No ComfyUI box is reachable — cannot animate.")
+    boxpool = healthy[:]
     for bi, s in enumerate(scenes):
-        outmp4 = os.path.join(wd, "clips", s["id"] + ".mp4")
+        sid = s["id"]
+        outmp4 = os.path.join(wd, "clips", sid + ".mp4")
         if os.path.exists(outmp4):
-            results[s["id"]] = outmp4
+            results[sid] = outmp4
+            rep("animate", sid, "skip", "exists")
             continue
-        box = boxes[bi % len(boxes)]["base"]
-        sb = os.path.join(wd, "storyboard", s["id"] + ".png")
+        box = boxpool[bi % len(boxpool)]["base"]
+        sb = os.path.join(wd, "storyboard", sid + ".png")
         start_image = None
         if os.path.exists(sb):
             up = upload_image(box, sb)
@@ -347,15 +453,22 @@ def stage_animate(cfg, boxes, wd):
         pos = (f"{s['visual']}. {s['cam']}. subtle natural motion, consistent lighting, {cfg['character'].get('identity','')} {cfg['style']['global_prompt']}")
         g = wan_i2v_graph(model, lora, clip_m, vae_m, pos, neg, random.randrange(0, 2 ** 31),
                           start_image, width=832, height=480, length=cfg["meta"]["clip_frames"],
-                          steps=4, prefix="vf_" + s["id"])
-        pid = queue(box, g)
-        if isinstance(pid, str):
-            pending.append((s["id"], box, pid, outmp4))
-            print("submit", s["id"], "@", box.replace("http://","").split(":")[0], pid[:8], flush=True)
+                          steps=4, prefix="vf_" + sid)
+        attempts = 0
+        while attempts < 3:
+            pid = queue(box, g)
+            if isinstance(pid, str):
+                pending.append((sid, box, pid, outmp4))
+                break
+            attempts += 1
+            rep("animate", sid, "retry", f"queue fail: {pid} try {attempts}")
+            time.sleep(4)
         else:
-            print("animate queue fail", s["id"], pid)
+            rep("animate", sid, "error", "queue failed 3x")
+            results[sid] = None
 
     # Phase 2: poll all pending in parallel
+    fails = []
     def poll_one(item):
         sid, box, pid, outmp4 = item
         st, outs = wait_prompt(box, pid)
@@ -371,7 +484,13 @@ def stage_animate(cfg, boxes, wd):
         for f in as_completed(futs):
             sid, out = f.result()
             results[sid] = out
-            print("animate", sid, "OK" if out else "FAIL", os.path.basename(out) if out else "!!", flush=True)
+            if out:
+                rep("animate", sid, "ok", os.path.basename(out))
+            else:
+                rep("animate", sid, "error", "no output")
+                fails.append(sid)
+    if fails:
+        rep("animate", "*", "warn", f"failed scenes: {fails}")
     return results
 
 def main():
@@ -391,26 +510,12 @@ def main():
         elif which == "animate":
             stage_animate_test(cfg, boxes, wd, args.test)
         return
-    stages = [st for st in args.stages.split(",") if st]
-    order = json.load(open(args.story))["meta"]  # keep ref
-    if "storyboard" in stages:
-        stage_storyboard(cfg, boxes, wd)
-    clips = {}
-    if "animate" in stages:
-        clips = stage_animate(cfg, boxes, wd)
-    if "voice" in stages:
-        stage_voice(cfg, wd)
-    if "render" in stages:
-        voice_files = {s["id"]: os.path.join(wd, "voice", s["id"] + ".mp3") for s in cfg["scenes"] if s.get("narration")}
-        n = len(cfg["scenes"])
-        clip_len = cfg["meta"]["clip_frames"] / cfg["meta"]["fps"]
-        total = n * clip_len + 1.0
-        music = stage_music(cfg, wd, total)
-        # fill any missing clips (shouldn't happen after animate)
-        clip_paths = clips or {s["id"]: os.path.join(wd, "clips", s["id"] + ".mp4") for s in cfg["scenes"]}
-        out = args.out or os.path.join(wd, "final.mp4")
-        ok = stage_render(cfg, wd, [s["id"] for s in cfg["scenes"]], voice_files if voice_files else {}, music, out)
-        print("render:", "OK" if ok else "FAIL", "->", out)
+    stages = tuple(st for st in args.stages.split(",") if st)
+    res = run_pipeline(args.story, stages=stages,
+                       progress=lambda st, scene, status, msg: print(f"[{st}:{scene}] {status} {msg or ''}".rstrip()))
+    print("pipeline:", res["status"], "->", res.get("final"))
+    if res.get("errors"):
+        print("errors:", res["errors"])
 
 if __name__ == "__main__":
     import numpy as np

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>videoforge — studio</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>videoforge <span>studio</span></h1>
+  <div class="boxhealth" id="boxhealth"><button onclick="refreshBoxes()">check boxes</button></div>
+</header>
+
+<main>
+  <section class="grid">
+    <!-- story -->
+    <div class="card" id="story-card">
+      <div class="card-head">
+        <h2>Story</h2>
+        <div class="row">
+          <select id="story-picker"></select>
+          <button id="btn-new" onclick="newStory()">new</button>
+        </div>
+      </div>
+      <textarea id="story-json" spellcheck="false" rows="18"></textarea>
+      <div class="row end">
+        <span id="story-status" class="muted"></span>
+        <button id="btn-save" onclick="saveStory()">save</button>
+      </div>
+    </div>
+
+    <!-- run -->
+    <div class="card" id="run-card">
+      <div class="card-head"><h2>Run pipeline</h2></div>
+      <div class="stages" id="stage-checks">
+        <label><input type="checkbox" value="storyboard" checked> storyboard</label>
+        <label><input type="checkbox" value="animate" checked> animate</label>
+        <label><input type="checkbox" value="voice" checked> voice</label>
+        <label><input type="checkbox" value="render" checked> render</label>
+      </div>
+      <div class="row">
+        <label class="muted">test scene
+          <select id="test-scene"><option value="">— full run —</option></select>
+        </label>
+      </div>
+      <div class="row">
+        <button id="btn-run" class="primary" onclick="runPipeline()">run</button>
+        <button id="btn-stop" onclick="stopJob()" disabled>stop</button>
+      </div>
+      <div class="muted" id="run-note"></div>
+    </div>
+  </section>
+
+  <!-- job monitor -->
+  <section class="card" id="job-card">
+    <div class="card-head"><h2>Job</h2><span id="job-status" class="pill idle">idle</span></div>
+    <div class="jobstage" id="job-stages"></div>
+    <pre id="job-log" class="log"></pre>
+  </section>
+
+  <!-- media -->
+  <section class="card">
+    <div class="card-head"><h2>Final video</h2></div>
+    <div id="final-vid" class="placeholder">no rendered video yet</div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>Storyboards</h2></div>
+    <div id="sb-grid" class="thumbs"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>Clips</h2></div>
+    <div id="clip-grid" class="thumbs"></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

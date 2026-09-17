@@ -22,7 +22,7 @@ story.json
                      → final.mp4
 ```
 
-Every stage is **idempotent** — completed files are skipped, so you can re-run or resume any stage.
+Every stage is **idempotent** — completed files are skipped, so you can re-run or resume any stage. `animate` probes box health first and skips dead boxes, retries failed prompts up to 3×, and falls back so a single dead box can't stall the run.
 
 ## Setup
 
@@ -40,6 +40,27 @@ Models live on two ComfyUI boxes (Promax, Spark2) behind Tailscale:
 ComfyUI containers must mount the host model dirs read-only (`-v /home/admin/models/program:/home/admin/models/program:ro`), because checkpoint symlinks point at host paths.
 
 ## Usage
+
+### Web UI (recommended)
+
+```bash
+cd videoforge
+python3 server/app.py --port 8790          # http://<laptop>:8790
+```
+
+Dashboard lets you:
+
+- write/edit a story JSON (with `new` + `save`), and pick a test scene
+- check ComfyUI box liveness (promax / spark2 health badges)
+- run the full pipeline or a subset of stages, one job at a time, with **stop**
+- watch live per-stage progress + timestamped log
+- preview storyboards, per-scene clips, and the finished video
+
+Jobs run in a background thread; state is persisted to `work/<vid>/run_<job>.json`
+so status survives a server restart. `POST /api/run` with
+`{"story": "...json", "stages": [...], "test_scene": "s01"}` is the programmatic entry point.
+
+### CLI
 
 ```bash
 python3 -u bin/videoforge stories/<story>.json                 # run all stages
