@@ -1,0 +1,14 @@
+# Generated outputs (large media) - never commit these
+work/
+*.mp4
+*.mp3
+*.png
+*.wav
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local
+*.log

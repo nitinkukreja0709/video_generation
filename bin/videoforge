@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""videoforge — consistent AI video pipeline.
+
+Story.json -> storyboard (SDXL txt2img) -> chained animation (Wan i2v)
+-> narration (Edge-TTS) -> music bed -> ffmpeg render.
+
+Pipeline order is chosen for CONSISTENCY:
+  * storyboards anchor the look/character per scene
+  * each video clip is image-to-video (i2v) seeded by that storyboard
+  * clips are CHAINED: clip N+1 starts from the last frame of clip N
+  * one speaker, one music bed, aligned narration, subtitle burn-in
+
+Usage:
+  videoforge story.json
+"""
+import argparse, json, os, re, subprocess, sys, time, urllib.request, random, wave, struct, shutil
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORK = os.path.join(ROOT, "work")
+
+# ---------- ComfyUI API helpers ----------
+def api(base, path, data=None, timeout=60, stream_out=None):
+    url = base + path
+    if data is not None:
+        req = urllib.request.Request(url, data=json.dumps(data).encode(), headers={"Content-Type": "application/json"})
+    else:
+        req = urllib.request.Request(url)
+    try:
+        try:
+            r = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            return {"error": e.read().decode()[:400]}
+        if stream_out:
+            with open(stream_out, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            return {"downloaded": os.path.getsize(stream_out)}
+        return json.loads(r.read().decode())
+    except Exception as e:
+        return {"error": str(e)}
+
+def upload_image(base, filename):
+    import mimetypes
+    mime = mimetypes.guess_type(filename)[0] or "image/png"
+    boundary = "----vf" + str(int(time.time() * 1000))
+    with open(filename, "rb") as f:
+        body = f.read()
+    pre = (f"--{boundary}\r\nContent-Disposition: form-data; name=image; filename={os.path.basename(filename)}\r\n"
+           f"Content-Type: {mime}\r\n\r\n").encode()
+    post = f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(base + "/upload/image", data=pre + body + post,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        return {"error": str(e)}
+
+def wait_prompt(base, pid, timeout=1800, poll=15):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        h = api(base, f"/history/{pid}")
+        if isinstance(h, dict) and pid in h:
+            e = h[pid]
+            st = e.get("status", {}).get("status_str")
+            if st in ("success", "error"):
+                vids = []
+                for nid, o in e.get("outputs", {}).items():
+                    for k in ("videos", "gifs", "images"):
+                        if k in o:
+                            vids += [(nid, k, i) for i in o[k]]
+                return st, vids
+        time.sleep(poll)
+    return "TIMEOUT", []
+
+def queue(base, graph):
+    d = api(base, "/prompt", graph)
+    return d.get("prompt_id") or d.get("error") or d
+
+# ---------- graph builders ----------
+def sdxl_storyboard_graph(ckpt, positive, negative, seed, w=1216, h=672, steps=28, cfg=7.0):
+    g = {
+      "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+      "2": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+      "3": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
+      "4": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+      "5": {"class_type": "KSampler", "inputs": {
+          "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0],
+          "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0}},
+      "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+      "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "vf_sb"}},
+    }
+    return {"prompt": g, "client_id": "videoforge"}
+
+def wan_i2v_graph(model_i2v, lora, clip, vae, positive, negative, seed, start_image,
+                  width=832, height=480, length=81, steps=4, prefix="vf_clip"):
+    g = {
+      "4": {"class_type": "UNETLoader", "inputs": {"unet_name": model_i2v, "weight_dtype": "default"}},
+      "15": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["4", 0], "lora_name": lora, "strength_model": 1.0}},
+      "17": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip, "type": "wan"}},
+      "6": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["17", 0]}},
+      "7": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["17", 0]}},
+      "16": {"class_type": "VAELoader", "inputs": {"vae_name": vae}},
+    }
+    img_ref = None
+    if start_image:
+        g["18"] = {"class_type": "LoadImage", "inputs": {"image": start_image}}
+        img_ref = ["18", 0]
+    g["12"] = {"class_type": "WanImageToVideo", "inputs": {
+          "positive": ["6", 0], "negative": ["7", 0], "vae": ["16", 0],
+          "width": width, "height": height, "length": length, "batch_size": 1, "seed": seed,
+          "start_image": img_ref}}
+    g["9"] = {"class_type": "KSampler", "inputs": {
+          "model": ["15", 0], "positive": ["12", 0], "negative": ["12", 1], "latent_image": ["12", 2],
+          "seed": seed, "steps": steps, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}}
+    g["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["16", 0]}}
+    g["11"] = {"class_type": "VHS_VideoCombine", "inputs": {
+          "images": ["10", 0], "frame_rate": 16, "loop_count": 0, "filename_prefix": prefix,
+          "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 18, "pingpong": False, "save_output": True}}
+    return {"prompt": g, "client_id": "videoforge"}
+
+def last_frame(videopath, outpng):
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-sseof", "-1", "-i", videopath, "-frames:v", "1", outpng], check=False)
+    return outpng if os.path.exists(outpng) and os.path.getsize(outpng) > 0 else None
+
+# ---------- audio ----------
+def tanpura_drone(seconds, sr=44100, f0=220.0, fout=None):
+    t = np.linspace(0, seconds, int(sr * seconds), endpoint=False)
+    from numpy import sin, random
+    sig = np.zeros_like(t)
+    for f, a in [(f0, .30), (f0 * 1.5, .22), (f0 * .5, .28), (f0 * 2.0, .14)]:
+        mod = .5 + .5 * np.sin(2 * np.pi * .5 * t + random.uniform(0, 6))
+        sig += a * mod * sin(2 * np.pi * f * t + random.uniform(0, 6))
+    for i in range(int(seconds / 2)):
+        st = i * 2.0 * sr
+        if st >= len(sig): break
+        n = min(4000, int(len(sig) - st))
+        k = np.linspace(0, 1, n)
+        env = np.exp(-6 * k)
+        freq = f0 * 2 ** (i % 7 / 12)
+        sig[int(st):int(st) + n] += .10 * env * sin(2 * np.pi * freq * k * (1 + (1 - k) * .02))
+    sig = sig / np.max(np.abs(sig)) * .5
+    data = (sig * 32767).astype(np.int16)
+    if fout is None:
+        return data, sr
+    with wave.open(fout, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes(data.tobytes())
+    return fout
+
+# ---------- stage: voice ----------
+def stage_voice(cfg, wd):
+    from edge_tts import Communicate
+    outdir = os.path.join(wd, "voice"); os.makedirs(outdir, exist_ok=True)
+    results = {}
+    for s in cfg["scenes"]:
+        txt = s.get("narration", "")
+        if not txt:
+            continue
+        out = os.path.join(outdir, f"{s['id']}.mp3")
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            results[s["id"]] = out; continue
+        comm = Communicate(txt, cfg["meta"].get("voice", "hi-IN-MadhurNeural"))
+        import asyncio
+        async def _w():
+            await comm.save(out)
+        asyncio.run(_w())
+        results[s["id"]] = out
+    print("voice:", json.dumps({k: os.path.basename(v) for k, v in results.items()}))
+    return results
+
+# ---------- stage: music ----------
+def stage_music(cfg, wd, total_dur):
+    import numpy as np
+    out = os.path.join(wd, "music.wav")
+    if not os.path.exists(out):
+        tanpura_drone(total_dur, fout=out)
+    return out
+
+# ---------- stage: render ----------
+def stage_render(cfg, wd, clips, voice_files, music, out_path):
+    clip_len = cfg["meta"]["clip_frames"] / cfg["meta"]["fps"]
+    N = len(clips)
+    fade = 0.4
+    step = clip_len - fade
+    sr = 44100
+    vid_count = len(clips)
+    ad_in = []
+    filt = []
+    idx = 0
+    for n, c in enumerate(clips):
+        if c not in voice_files: continue
+        mp3 = voice_files[c]
+        wav = os.path.join(wd, "voice", f"{c}.wav")
+        if not os.path.exists(wav):
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", mp3, "-ac", "1", "-ar", str(sr), wav], check=True)
+        ad_in.append(wav)
+        delay = int((n * step + fade) * 1000)
+        filt.append(f"[{vid_count+idx}:a]adelay={delay}|{delay},volume={cfg['meta'].get('voice_volume',1.0)}[an{idx}]")
+        idx += 1
+    ad_in.append(music)
+    filt.append(f"[{vid_count+idx}:a]volume={cfg['meta'].get('music_volume',0.32)}[mu]")
+    nv = len(ad_in) - 1
+    mixin = "".join(f"[an{i}]" for i in range(nv)) + "[mu]"
+    filt.append(f"{mixin}amix=inputs={len(ad_in)}:normalize=0,alimiter=limit=0.95[aout]")
+
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    for c in clips:
+        cmd += ["-i", os.path.join(wd, "clips", c + ".mp4")]
+    for a in ad_in:
+        cmd += ["-i", a]
+
+    vf = ["[0:v]scale=1280:720:flags=lanczos,format=yuv420p[v0]"]
+    for i in range(1, N):
+        vf.append(f"[{i}:v]scale=1280:720:flags=lanczos,format=yuv420p[vi{i}]")
+    prev = "[v0]"
+    for i in range(1, N):
+        off = i * step
+        lbl = f"x{i}"
+        vf.append(f"{prev}[vi{i}]xfade=transition=fade:duration={fade}:offset={off:.2f}[{lbl}]")
+        prev = f"[{lbl}]"
+    total = N * clip_len - (N - 1) * fade
+    vf.append(f"{prev}unsharp=5:5:1.0:5:5:0.0,format=yuv420p,fade=t=in:d=0.6,fade=t=out:st={total-1.6:.2f}:d=1.6[v]")
+    vf.append("[aout]afade=t=in:d=0.5,afade=t=out:st=" + f"{total-2.2:.2f}:d=2.2" + "[a]")
+
+    cmd += ["-filter_complex", ";".join(filt + vf), "-map", "[v]", "-map", "[a]",
+            "-r", str(cfg["meta"]["fps"]), "-c:v", "libx264", "-crf", "19", "-preset", "medium",
+            "-c:a", "aac", "-b:a", "192k", "-t", f"{total:.1f}", out_path]
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("render error:", r.stderr[-1500:])
+        return False
+    return True
+
+def ffprobe_dur(p):
+    out = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p]).decode().strip()
+    return float(out)
+
+# ---------- storyboard test ----------
+def stage_storyboard_test(cfg, boxes, wd, scene_id):
+    ckpt = "sd_xl_base_1.0.safetensors"
+    style = cfg["style"]
+    char = cfg.get("character", {}).get("physical", "")
+    base = boxes[0]
+    s = next(x for x in cfg["scenes"] if x["id"] == scene_id)
+    pos = (f"{char}. {cfg['character'].get('identity','')}. {s['visual']}. {s['cam']}. {style['global_prompt']}")
+    g = sdxl_storyboard_graph(ckpt, pos, style["negative_prompt"], 424242)
+    pid = queue(base["base"], g)
+    if not isinstance(pid, str):
+        print("queue fail:", pid); return
+    st, outs = wait_prompt(base["base"], pid)
+    fname = next((o[2]["filename"] for o in outs if o[1] == "images"), None)
+    out = os.path.join(wd, "test_sb.png")
+    if fname:
+        api(base["base"], f"/view?filename={fname}&subfolder=&type=output", stream_out=out)
+        print("storyboard test", st, os.path.getsize(out), "bytes")
+
+def stage_animate_test(cfg, boxes, wd, scene_id):
+    model = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+    lora = "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+    clip_m = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+    vae_m = "wan_2.1_vae.safetensors"
+    neg = cfg["style"]["negative_prompt"]
+    s = next(x for x in cfg["scenes"] if x["id"] == scene_id)
+    box = boxes[0]["base"]
+    sb = os.path.join(wd, "storyboard", s["id"] + ".png")
+    print("DEBUG animate_test box", box, "sb", os.path.exists(sb), file=sys.stderr)
+    img = sb if os.path.exists(sb) else os.path.join(wd, "test_sb.png")
+    up = upload_image(box, img)
+    print("DEBUG upload:", up, file=sys.stderr)
+    pos = (f"{s['visual']}. {s['cam']}. subtle natural motion, consistent lighting, {cfg['character'].get('identity','')} {cfg['style']['global_prompt']}")
+    g = wan_i2v_graph(model, lora, clip_m, vae_m, pos, neg, 123456, up.get("name"),
+                      width=832, height=480, length=81, steps=4, prefix="vf_test")
+    pid = queue(box, g)
+    print("DEBUG queue:", pid, file=sys.stderr)
+    if not isinstance(pid, str):
+        print("queue fail:", pid); return
+    st, outs = wait_prompt(box, pid)
+    print("DEBUG wait:", st, outs, file=sys.stderr)
+    fname = next((o[2]["filename"] for o in outs if o[1] in ("videos", "gifs")), None)
+    out = os.path.join(wd, "test_clip.mp4")
+    if fname:
+        api(box, f"/view?filename={fname}&subfolder=&type=output", stream_out=out)
+        print("animate test", st, os.path.getsize(out), "bytes")
+
+# ---------- main ----------
+def load_cfg(path):
+    with open(path) as f:
+        return json.load(f)
+
+def wd_for(cfg):
+    vid = cfg["meta"]["vid"]
+    wd = os.path.join(WORK, vid)
+    os.makedirs(os.path.join(wd, "clips"), exist_ok=True)
+    os.makedirs(os.path.join(wd, "storyboard"), exist_ok=True)
+    return wd
+
+def stage_storyboard(cfg, boxes, wd):
+    ckpt = "sd_xl_base_1.0.safetensors"
+    style = cfg["style"]
+    char = cfg.get("character", {}).get("physical", "")
+    base = boxes[0]
+    fixed = random.Random(42)
+    for s in cfg["scenes"]:
+        out = os.path.join(wd, "storyboard", s["id"] + ".png")
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            continue
+        # identity block repeated verbatim for character/place consistency
+        pos = (f"{char}. {cfg['character'].get('identity','')}. {s['visual']}. {s['cam']}. {style['global_prompt']}")
+        g = sdxl_storyboard_graph(ckpt, pos, style["negative_prompt"], fixed.randrange(0, 2 ** 31))
+        pid = queue(base["base"], g)
+        if not isinstance(pid, str):
+            print("storyboard queue fail", s["id"], pid); continue
+        st, outs = wait_prompt(base["base"], pid)
+        fname = next((o[2]["filename"] for o in outs if o[1] == "images"), None)
+        if fname:
+            api(base["base"], f"/view?filename={fname}&subfolder=&type=output", stream_out=out)
+        print("storyboard", s["id"], st, os.path.basename(out))
+    return os.path.join(wd, "storyboard")
+
+def stage_animate(cfg, boxes, wd):
+    model = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+    lora = "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+    clip_m = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+    vae_m = "wan_2.1_vae.safetensors"
+    neg = cfg["style"]["negative_prompt"]
+    scenes = cfg["scenes"]
+
+    # Phase 1: submit all clips, round-robin across boxes, upload storyboards to target box
+    pending = []  # (scene_id, boxbase, prompt_id, outmp4)
+    results = {}
+    for bi, s in enumerate(scenes):
+        outmp4 = os.path.join(wd, "clips", s["id"] + ".mp4")
+        if os.path.exists(outmp4):
+            results[s["id"]] = outmp4
+            continue
+        box = boxes[bi % len(boxes)]["base"]
+        sb = os.path.join(wd, "storyboard", s["id"] + ".png")
+        start_image = None
+        if os.path.exists(sb):
+            up = upload_image(box, sb)
+            start_image = up.get("name")
+        pos = (f"{s['visual']}. {s['cam']}. subtle natural motion, consistent lighting, {cfg['character'].get('identity','')} {cfg['style']['global_prompt']}")
+        g = wan_i2v_graph(model, lora, clip_m, vae_m, pos, neg, random.randrange(0, 2 ** 31),
+                          start_image, width=832, height=480, length=cfg["meta"]["clip_frames"],
+                          steps=4, prefix="vf_" + s["id"])
+        pid = queue(box, g)
+        if isinstance(pid, str):
+            pending.append((s["id"], box, pid, outmp4))
+            print("submit", s["id"], "@", box.replace("http://","").split(":")[0], pid[:8], flush=True)
+        else:
+            print("animate queue fail", s["id"], pid)
+
+    # Phase 2: poll all pending in parallel
+    def poll_one(item):
+        sid, box, pid, outmp4 = item
+        st, outs = wait_prompt(box, pid)
+        fname = next((o[2]["filename"] for o in outs if o[1] in ("videos", "gifs")), None)
+        if fname:
+            api(box, f"/view?filename={fname}&subfolder=&type=output", stream_out=outmp4)
+            return sid, outmp4
+        return sid, None
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=len(pending) or 1) as ex:
+        futs = {ex.submit(poll_one, p): p for p in pending}
+        for f in as_completed(futs):
+            sid, out = f.result()
+            results[sid] = out
+            print("animate", sid, "OK" if out else "FAIL", os.path.basename(out) if out else "!!", flush=True)
+    return results
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("story")
+    ap.add_argument("--stages", default="storyboard,animate,voice,render")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--test", default=None, help="scene id for single-scene validation")
+    args = ap.parse_args()
+    cfg = load_cfg(args.story)
+    boxes = [cfg["boxes"][k] for k in sorted(cfg["boxes"])]
+    wd = wd_for(cfg)
+    if args.test:
+        which = args.stages  # e.g. --test s01 --stages storyboard|animate
+        if which == "storyboard":
+            stage_storyboard_test(cfg, boxes, wd, args.test)
+        elif which == "animate":
+            stage_animate_test(cfg, boxes, wd, args.test)
+        return
+    stages = [st for st in args.stages.split(",") if st]
+    order = json.load(open(args.story))["meta"]  # keep ref
+    if "storyboard" in stages:
+        stage_storyboard(cfg, boxes, wd)
+    clips = {}
+    if "animate" in stages:
+        clips = stage_animate(cfg, boxes, wd)
+    if "voice" in stages:
+        stage_voice(cfg, wd)
+    if "render" in stages:
+        voice_files = {s["id"]: os.path.join(wd, "voice", s["id"] + ".mp3") for s in cfg["scenes"] if s.get("narration")}
+        n = len(cfg["scenes"])
+        clip_len = cfg["meta"]["clip_frames"] / cfg["meta"]["fps"]
+        total = n * clip_len + 1.0
+        music = stage_music(cfg, wd, total)
+        # fill any missing clips (shouldn't happen after animate)
+        clip_paths = clips or {s["id"]: os.path.join(wd, "clips", s["id"] + ".mp4") for s in cfg["scenes"]}
+        out = args.out or os.path.join(wd, "final.mp4")
+        ok = stage_render(cfg, wd, [s["id"] for s in cfg["scenes"]], voice_files if voice_files else {}, music, out)
+        print("render:", "OK" if ok else "FAIL", "->", out)
+
+if __name__ == "__main__":
+    import numpy as np
+    main()

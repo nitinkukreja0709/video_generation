@@ -1,0 +1,65 @@
+{
+  "meta": {
+    "title": "Kabir's Date Palm",
+    "language": "hi",
+    "voice": "hi-IN-MadhurNeural",
+    "aspect": "832x480",
+    "fps": 16,
+    "clip_frames": 81,
+    "music": "tanpura",
+    "subtitles": true,
+    "music_volume": 0.32,
+    "voice_volume": 1.0,
+    "vid": "2026-09-17-kabir"
+  },
+  "style": {
+    "global_prompt": "cinematic film still, warm golden-hour light, dry rural Indian village road, lush mango trees, soft dust in the air, gentle glow, documentary color grade, 35mm film grain, serene atmosphere",
+    "negative_prompt": "blurry, distorted, deformed face, extra limbs, bad hands, watermark, text, captions, low quality, jpeg artifacts, oversaturated, fisheye, dutch angle, flicker, morphing"
+  },
+  "character": {
+    "physical": "elderly Indian traveler, ~70 years old, warm brown skin, deep-set kind eyes, white beard, white cotton dhoti, cream kurta, pale orange turban, simple cloth bundle on a bamboo stick over his shoulder, barefoot",
+    "identity": "the same old traveler appears in ALL scenes exactly as described; keep his face, clothes and bundle identical in every shot"
+  },
+  "boxes": {
+    "promax": {"base": "http://100.81.202.86:8188"},
+    "spark2": {"base": "http://100.108.126.6:8188"}
+  },
+  "scenes": [
+    {"id":"s01", "duration":5, "cam":"wide establishing aerial shot slowly pushing forward",
+     "visual":"empty dusty village road at golden hour with a lone old traveler walking away from camera",
+     "narration":"सुनिए कबीर दास की एक प्रेरणादायक कहानी।"},
+    {"id":"s02", "duration":5, "cam":"low angle medium shot tilting up, slow zoom",
+     "visual":"the old traveler stops and looks up at a gigantic tall date palm with a long bare brown trunk, spiky leaves high at the top, harsh sun",
+     "narration":"एक गर्म दोपहर में, एक राहगीर को रास्ते में एक विशाल खजूर का पेड़ मिला।"},
+    {"id":"s03", "duration":5, "cam":"medium side shot, slow tracking",
+     "visual":"the traveler sits resting his back against the bare trunk of the tall date palm, wiping sweat, no shade around, blazing sunlight",
+     "narration":"वह पेड़ कितना बड़ा था, पर उसकी छाया नहीं थी।"},
+    {"id":"s04", "duration":5, "cam":"high angle reverse shot looking up",
+     "visual":"close framing of the traveler craning his neck toward a cluster of ripe golden dates far up in the palm crown, out of reach, hand lifted",
+     "narration":"फल भी बहुत ऊँचे थे, हाथ की पहुँच से परे।"},
+    {"id":"s05", "duration":5, "cam":"wide tracking shot, lateral move",
+     "visual":"the traveler walks away from the tall bare palm toward a small humble leafy neem tree in a green field ahead, birds resting on it",
+     "narration":"थका हुआ राहगीर आगे बढ़ा, और एक छोटे से नीम के पेड़ के पास पहुँचा।"},
+    {"id":"s06", "duration":5, "cam":"low wide shot under the canopy, slow push-in",
+     "visual":"the traveler sits comfortably under the low spreading branches of the small neem tree, dense cool shade covering him fully, relief on his face, dappled light",
+     "narration":"छोटे से पेड़ की घनी, ठंडी छाया में बैठते ही उसे राहत मिली।"},
+    {"id":"s07", "duration":5, "cam":"medium shot, gentle orbit",
+     "visual":"a village boy and two villagers join the traveler under the neem tree, sharing water and laughing in the cool shade, warm community moment",
+     "narration":"आस-पास के लोग भी आ गए, छाया में बैठकर सबने विश्राम किया।"},
+    {"id":"s08", "duration":5, "cam":"split composition static wide shot",
+     "visual":"in the far background the enormous bare date palm stands alone at the edge of the field, in the foreground the small leafy neem tree shelters the happy group of villagers, strong visual contrast",
+     "narration":"पर उस विशाल खजूर के पेड़ के पास कोई नहीं रुका।"},
+    {"id":"s09", "duration":5, "cam":"medium tracking shot, slow approach",
+     "visual":"a serene elderly philosopher-saint in simple white robes with a wooden walking stick approaches the group under the neem tree, children tugging his robe affectionately, gentle smile",
+     "narration":"तभी कबीर दास वहाँ आए, और यह दोहा सुनाया।"},
+    {"id":"s10", "duration":5, "cam":"medium close-up, locked off",
+     "visual":"the sage raises one finger, speaking to the villagers gathered under the neem tree, late afternoon light streaming through the leaves, storytelling mood",
+     "narration":"बड़ा हुआ तो क्या हुआ, जैसे पेड़ खजूर। पंथी को छाया नहीं, फल लागे अति दूर।"},
+    {"id":"s11", "duration":5, "cam":"extreme close-up of the face, slow push-in",
+     "visual":"close-up of the wise sage's weathered kind face narrating, eyes twinkling, villagers and the old traveler listening around him, golden light",
+     "narration":"अर्थात, बड़ा होने से क्या फ़ायदा, जो किसी के काम न आए।"},
+    {"id":"s12", "duration":5, "cam":"ultimate wide shot at dusk, slow pull-back",
+     "visual":"peaceful dusk, sunset sky orange and purple, in the foreground the small neem tree glowing warm with villagers still gathered beneath it, in the far distance the lone tall bare date palm silhouetted against the fading light",
+     "narration":"विद्या और धन वही सार्थक हैं, जो दूसरों के काम आएँ।"}
+  ]
+}
